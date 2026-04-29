@@ -700,6 +700,26 @@ int parseconfig(char *configfile)
 							return(i);
 						}
 						dprint_sequence(door, "config: %s: sequence: ", door->name);
+					} else if(!strcmp(key, "SEQUENCE_FILE")) {
+						FILE *sfp = fopen(ptr, "r");
+						if(sfp == NULL) {
+							perror(ptr);
+							return(1);
+						}
+						char buf[PATH_MAX] = "";
+						dprint("config: %s: sequence file: %s\n", door->name, ptr);
+						size_t sfp_read = fread(buf, sizeof(char), PATH_MAX - 1, sfp);
+						fclose(sfp);
+						if(sfp_read == 0) {
+							fprintf(stderr, "config: line %d: sequence file empty: %s", linenum, ptr);
+							return(1);
+						}
+						buf[sfp_read] = '\0';
+						int i = parse_port_sequence(buf, door);
+						if(i > 0) {
+							return(i);
+						}
+						dprint_sequence(door, "config: %s: sequence: ", door->name);
 					} else if(!strcmp(key, "ONE_TIME_SEQUENCES")) {
 						if((door->one_time_sequences_fd = fopen(ptr, "r+")) == NULL) {
 							perror(ptr);
@@ -949,6 +969,26 @@ int parseserviceconfig(char *configfile)
 				} else if(!strcmp(key, "SEQUENCE")) {
 					int i;
 					i = parse_port_sequence(ptr, door);
+					if(i > 0) {
+						return(i);
+					}
+					dprint_sequence(door, "config: %s: sequence: ", door->name);
+				} else if(!strcmp(key, "SEQUENCE_FILE")) {
+					FILE *sfp = fopen(ptr, "r");
+					if(sfp == NULL) {
+						perror(ptr);
+						return(1);
+					}
+					char buf[PATH_MAX] = "";
+					dprint("config: %s: sequence file: %s\n", door->name, ptr);
+					size_t sfp_read = fread(buf, sizeof(char), PATH_MAX - 1, sfp);
+					fclose(sfp);
+					if(sfp_read == 0) {
+						fprintf(stderr, "config: line %d: sequence file empty: %s", linenum, ptr);
+						return(1);
+					}
+					buf[sfp_read] = '\0';
+					int i = parse_port_sequence(buf, door);
 					if(i > 0) {
 						return(i);
 					}
