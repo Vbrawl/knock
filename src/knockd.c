@@ -56,6 +56,7 @@
 #include <syslog.h>
 #include <pcap.h>
 #include <errno.h>
+#include <dirent.h>
 #include "list.h"
 
 #if __APPLE__
@@ -127,6 +128,7 @@ char* strtoupper(char *str);
 char* trim(char *str);
 void runCommand(char *cmd);
 int parseconfig(char *configfile);
+int parseserviceconfig(char *configfile);
 int parse_port_sequence(char *sequence, opendoor_t *door);
 int get_new_one_time_sequence(opendoor_t *door);
 long get_next_one_time_sequence(opendoor_t *door);
@@ -572,6 +574,8 @@ int parseconfig(char *configfile)
 	char *key = NULL;
 	int linenum = 0;
 	char section[256] = "";
+	char include_dir[PATH_MAX] = "";
+	int include_dir_specified = 0;
 	opendoor_t *door = NULL;
 	PMList *lp;
 
@@ -666,6 +670,11 @@ int parseconfig(char *configfile)
 							o_int[sizeof(o_int)-1] = '\0';
 							dprint("config: interface: %s\n", o_int);
 						}
+					} else if(!strcmp(key, "INCLUDE_DIR")) {
+						strncpy(include_dir, ptr, PATH_MAX-1);
+						include_dir[PATH_MAX-1] = '\0';
+						include_dir_specified = 1;
+						dprint("config: include directory: %s\n", include_dir);
 					} else {
 						fprintf(stderr, "config: line %d: syntax error\n", linenum);
 						return(1);
@@ -781,6 +790,258 @@ int parseconfig(char *configfile)
 						fprintf(stderr, "config: line %d: syntax error\n", linenum);
 						return(1);
 					}
+				}
+				line[0] = '\0';
+			}
+		}
+	}
+	fclose(fp);
+
+	/* sanity checks */
+	for(lp = doors; lp; lp = lp->next) {
+		door = (opendoor_t*)lp->data;
+		if(door->seqcount == 0) {
+			fprintf(stderr, "error: section '%s' has an empty knock sequence\n", door->name);
+			return(1);
+		}
+	}
+
+	if(include_dir_specified) {
+		DIR *d = opendir(include_dir);
+		char service_path[PATH_MAX] = "";
+		if(d == NULL) {
+			perror("opendir");
+		}
+		else {
+			struct dirent *entry;
+			while((entry = readdir(d)) != NULL) {
+				if(entry->d_name[0] == '.' && (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
+					continue;
+				}
+
+				if(entry->d_type == DT_REG) {
+					int path_length = snprintf(service_path, PATH_MAX, "%s/%s", include_dir, entry->d_name);
+					if(path_length > PATH_MAX) {
+						fprintf(stderr, "error: path too long, skipping: %s\n", entry->d_name);
+						continue;
+					}
+					int scode = parseserviceconfig(service_path);
+					if(scode != 0) {
+						closedir(d);
+						return(scode);
+					}
+				}
+				else {
+					fprintf(stderr, "warning: Found non-regular file in the include directory: %s\n", entry->d_name);
+				}
+			}
+			closedir(d);
+		}
+	}
+
+	return(0);
+}
+
+/* Parse a service config file
+ */
+int parseserviceconfig(char *configfile)
+{
+	FILE *fp = NULL;
+	char line[PATH_MAX+1];
+	char *ptr = NULL;
+	char *key = NULL;
+	int linenum = 0;
+	char section[256] = "";
+	opendoor_t *door = NULL;
+	PMList *lp;
+
+	if((fp = fopen(configfile, "r")) == NULL) {
+		perror(configfile);
+		return(1);
+	}
+
+	while(fgets(line, PATH_MAX, fp)) {
+		linenum++;
+		trim(line);
+		if(strlen(line) == 0 || line[0] == '#') {
+			continue;
+		}
+		if(line[0] == '[' && line[strlen(line)-1] == ']') {
+			/* new config section */
+			ptr = line;
+			ptr++;
+			strncpy(section, ptr, sizeof(section));
+			section[sizeof(section)-1] = '\0';
+			section[strlen(section)-1] = '\0';
+			dprint("config: new section: '%s'\n", section);
+			if(!strlen(section)) {
+				fprintf(stderr, "config: line %d: bad section name\n", linenum);
+				return(1);
+			}
+			if(!strcmp(section, "options")) {
+				fprintf(stderr, "config: line %d: service configs can't have [options] section\n", linenum);
+				return(1);
+			} else {
+				/* start a new knock/event record */
+				door = malloc(sizeof(opendoor_t));
+				if(door == NULL) {
+					perror("malloc");
+					exit(1);
+				}
+				strncpy(door->name, section, sizeof(door->name)-1);
+				door->name[sizeof(door->name)-1] = '\0';
+				door->target = 0;
+				door->seqcount = 0;
+				door->seq_timeout  = SEQ_TIMEOUT; /* default sequence timeout (seconds)  */
+				door->start_command = NULL;
+				door->start_command6 = NULL;
+				door->cmd_timeout = CMD_TIMEOUT; /* default command timeout (seconds) */
+				door->stop_command = NULL;
+				door->stop_command6 = NULL;
+				door->flag_fin = DONT_CARE;
+				door->flag_syn = DONT_CARE;
+				door->flag_rst = DONT_CARE;
+				door->flag_psh = DONT_CARE;
+				door->flag_ack = DONT_CARE;
+				door->flag_urg = DONT_CARE;
+				door->one_time_sequences_fd = NULL;
+				door->pcap_filter_exp = NULL;
+				door->pcap_filter_expv6 = NULL;
+				doors = list_add(doors, door);
+			}
+		} else {
+			/* directive */
+			if(!strlen(section)) {
+				fprintf(stderr, "config: line %d: all directives must belong to a section\n", linenum);
+				return(1);
+			}
+			ptr = line;
+			key = strsep(&ptr, "=");
+			if(key == NULL) {
+				fprintf(stderr, "config: line %d: syntax error\n", linenum);
+				return(1);
+			}
+			trim(key);
+			key = strtoupper(key);
+			if(ptr == NULL) {
+				if(!strcmp(key, "USESYSLOG")) {
+					o_usesyslog = 1;
+					dprint("config: usesyslog\n");
+				} else {
+					fprintf(stderr, "config: line %d: syntax error\n", linenum);
+					return(1);
+				}
+			} else {
+				trim(ptr);
+				if(door == NULL) {
+					fprintf(stderr, "config: line %d: \"%s\" can only be used within a Door section\n",
+							linenum, key);
+					return(1);
+				}
+				if(!strcmp(key, "TARGET")) {
+					door->target = malloc(sizeof(char) * (strlen(ptr)+1));
+					if(door->target == NULL) {
+						perror("malloc");
+						exit(1);
+					}
+					strcpy(door->target, ptr);
+					dprint("config: %s: target: %s\n", door->name, door->target);
+				} else if(!strcmp(key, "SEQUENCE")) {
+					int i;
+					i = parse_port_sequence(ptr, door);
+					if(i > 0) {
+						return(i);
+					}
+					dprint_sequence(door, "config: %s: sequence: ", door->name);
+				} else if(!strcmp(key, "ONE_TIME_SEQUENCES")) {
+					if((door->one_time_sequences_fd = fopen(ptr, "r+")) == NULL) {
+						perror(ptr);
+						return(1);
+					}
+					dprint("config: %s: one time sequences file: %s\n", door->name, ptr);
+					if(get_new_one_time_sequence(door) == 0) {
+						dprint_sequence(door, "config: %s: sequence: ", door->name);
+					} else {	/* no more sequences left in the one time sequences file */
+						dprint("config: no more sequences left in the one time sequences file %s\n", ptr);
+						return(1);
+					}
+				} else if(!strcmp(key, "SEQ_TIMEOUT") || !strcmp(key, "TIMEOUT")) {
+					door->seq_timeout = (time_t)atoi(ptr);
+					dprint("config: %s: seq_timeout: %d\n", door->name, door->seq_timeout);
+				} else if(!strcmp(key, "START_COMMAND") || !strcmp(key, "COMMAND")) {
+					door->start_command = malloc(sizeof(char) * (strlen(ptr)+1));
+					if(door->start_command == NULL) {
+						perror("malloc");
+						exit(1);
+					}
+					strcpy(door->start_command, ptr);
+					dprint("config: %s: start_command: %s\n", door->name, door->start_command);
+				} else if(!strcmp(key, "START_COMMAND_6") || !strcmp(key, "COMMAND_6")) {
+					door->start_command6 = malloc(sizeof(char) * (strlen(ptr)+1));
+					if(door->start_command6 == NULL) {
+						perror("malloc");
+						exit(1);
+					}
+					strcpy(door->start_command6, ptr);
+					dprint("config: %s: start_command_6: %s\n", door->name, door->start_command6);
+				} else if(!strcmp(key, "CMD_TIMEOUT")) {
+					door->cmd_timeout = (time_t)atoi(ptr);
+					dprint("config: %s: cmd_timeout: %d\n", door->name, door->cmd_timeout);
+				} else if(!strcmp(key, "STOP_COMMAND")) {
+					door->stop_command = malloc(sizeof(char) * (strlen(ptr)+1));
+					if(door->stop_command == NULL) {
+						perror("malloc");
+						exit(1);
+					}
+					strcpy(door->stop_command, ptr);
+					dprint("config: %s: stop_command: %s\n", door->name, door->stop_command);
+				} else if(!strcmp(key, "STOP_COMMAND_6")) {
+					door->stop_command6 = malloc(sizeof(char) * (strlen(ptr)+1));
+					if(door->stop_command6 == NULL) {
+						perror("malloc");
+						exit(1);
+					}
+					strcpy(door->stop_command6, ptr);
+					dprint("config: %s: stop_command_6: %s\n", door->name, door->stop_command6);
+				} else if(!strcmp(key, "TCPFLAGS")) {
+					char *flag;
+					strtoupper(ptr);
+					while((flag = strsep(&ptr, ","))) {
+						/* allow just some flags to be specified */
+						if(!strcmp(flag,"FIN")) {
+							door->flag_fin = SET;
+						} else if(!strcmp(flag,"!FIN")) {
+							door->flag_fin = NOT_SET;
+						} else if(!strcmp(flag, "SYN")) {
+							door->flag_syn = SET;
+						} else if(!strcmp(flag, "!SYN")) {
+							door->flag_syn = NOT_SET;
+						} else if(!strcmp(flag, "RST")) {
+							door->flag_rst = SET;
+						} else if(!strcmp(flag, "!RST")) {
+							door->flag_rst = NOT_SET;
+						} else if(!strcmp(flag, "PSH")) {
+							door->flag_psh = SET;
+						} else if(!strcmp(flag, "!PSH")) {
+							door->flag_psh = NOT_SET;
+						} else if(!strcmp(flag, "ACK")) {
+							door->flag_ack = SET;
+						} else if(!strcmp(flag, "!ACK")) {
+							door->flag_ack = NOT_SET;
+						} else if(!strcmp(flag, "URG")) {
+							door->flag_urg = SET;
+						} else if(!strcmp(flag, "!URG")) {
+							door->flag_urg = NOT_SET;
+						} else {
+							fprintf(stderr, "config: line %d: unrecognized flag \"%s\"\n",
+									linenum, flag);
+							return(1);
+						}
+						dprint("config: tcp flag: %s\n", flag);
+					}
+				} else {
+					fprintf(stderr, "config: line %d: syntax error\n", linenum);
+					return(1);
 				}
 				line[0] = '\0';
 			}
