@@ -14,7 +14,7 @@ endif
 dist_doc_DATA = README.md TODO ChangeLog COPYING
 
 knock_SOURCES = src/knock.c
-knockd_SOURCES = src/knockd.c src/list.c src/list.h src/knock_helper_ipt.sh
+knockd_SOURCES = src/knockd.c src/list.c src/list.h src/utils.c src/utils.h src/dprint.c src/dprint.h src/door.c src/door.h src/sequences.c src/sequences.h src/config_parser.c src/config_parser.h src/knock_helper_ipt.sh
 
 %.1: %.1.in
 	sed -e "s/#VERSION#/$(VERSION)/" $< > $@
